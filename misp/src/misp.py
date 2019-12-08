@@ -5,11 +5,13 @@ import time
 from datetime import datetime
 from dateutil.parser import parse
 from pymisp import ExpandedPyMISP
-from stix2 import Bundle, Identity, ThreatActor, IntrusionSet, Malware, Tool, Report, Indicator, Relationship, \
+from stix2 import Bundle, Identity, IntrusionSet, Malware, Tool, Report, Indicator, Relationship, \
     ExternalReference, TLP_WHITE, TLP_GREEN, \
     TLP_AMBER, TLP_RED
 
 from pycti import OpenCTIConnectorHelper
+
+file_types = ['File-Name', 'File-MD5', 'File-SHA1', 'File-SHA256']
 
 
 class Misp:
@@ -19,14 +21,23 @@ class Misp:
         config = yaml.load(open(config_file_path), Loader=yaml.FullLoader) if os.path.isfile(config_file_path) else {}
         self.helper = OpenCTIConnectorHelper(config)
         # Extra config
-        self.misp_url = os.getenv('MISP_URL') or config['misp']['url']
-        self.misp_key = os.getenv('MISP_KEY') or config['misp']['key']
-        self.misp_tag = os.getenv('MISP_TAG') or config['misp']['tag'] if 'tag' in config['misp'] else None
-        self.misp_untag_event = os.getenv('MISP_UNTAG_EVENT') or config['misp']['untag_event'] \
-            if 'untag_event' in config['misp'] else None
-        self.misp_imported_tag = os.getenv('MISP_IMPORTED_TAG') or config['misp']['imported_tag']
-        self.misp_filter_on_imported_tag = os.getenv('MISP_FILTER_ON_IMPORTED_TAG') or config['misp']['filter_on_imported_tag']
-        self.misp_interval = os.getenv('MISP_INTERVAL') or config['misp']['interval']
+        self.misp_url = os.getenv('MISP_URL') or config.get('misp', {}).get('url')
+        self.misp_key = os.getenv('MISP_KEY') or config.get('misp', {}).get('key')
+        self.misp_tag = os.getenv('MISP_TAG') or config.get('misp', {}).get('tag')
+        self.misp_untag_event = os.getenv('MISP_UNTAG_EVENT') or config.get('misp', {}).get('untag_event')
+        self.misp_imported_tag = os.getenv('MISP_IMPORTED_TAG') or config.get('misp', {}).get('imported_tag')
+        self.misp_filter_on_imported_tag = os.getenv('MISP_FILTER_ON_IMPORTED_TAG') == 'True' or config.get('misp',
+                                                                                                            {}).get(
+            'filter_on_imported_tag')
+        if isinstance(self.misp_filter_on_imported_tag, str):
+            self.misp_filter_on_imported_tag = (
+                    self.misp_filter_on_imported_tag == 'True' or self.misp_filter_on_imported_tag == 'true')
+        self.misp_interval = os.getenv('MISP_INTERVAL') or config.get('misp', {}).get('interval')
+        self.update_existing_data = os.getenv('CONNECTOR_UPDATE_EXISTING_DATA') or config['connector'][
+            'update_existing_data']
+        if isinstance(self.update_existing_data, str):
+            self.update_existing_data = (self.update_existing_data == 'True' or self.update_existing_data == 'true')
+        self.misp_imported_tag = self.misp_imported_tag.replace('\\', '')
 
         # Initialize MISP
         self.misp = ExpandedPyMISP(url=self.misp_url, key=self.misp_key, ssl=False, debug=False)
@@ -44,7 +55,8 @@ class Misp:
                     and_parameters = [self.misp_tag]
                 if self.misp_filter_on_imported_tag:
                     not_parameters = [self.misp_imported_tag]
-                complex_query = self.misp.build_complex_query(and_parameters=and_parameters, not_parameters=not_parameters)
+                complex_query = self.misp.build_complex_query(and_parameters=and_parameters,
+                                                              not_parameters=not_parameters)
                 events = self.misp.search('events', tags=complex_query)
                 self.process_events(events)
                 time.sleep(self.get_interval())
@@ -55,13 +67,31 @@ class Misp:
                 self.helper.log_error(str(e))
                 time.sleep(self.get_interval())
 
+    def process_observable_relations(self, object_attributes, result_table, start_element=0):
+        if start_element == 0:
+            result_table = []
+        if len(object_attributes) == 1:
+            return []
+
+        for x in range(start_element + 1, len(object_attributes)):
+            result_table.append(
+                Relationship(
+                    relationship_type='corresponds',
+                    source_ref=object_attributes[start_element]['indicator']['id'],
+                    target_ref=object_attributes[x]['indicator']['id'],
+                    description='Same file',
+                    custom_properties={
+                        'x_opencti_ignore_dates': True
+                    }
+                )
+            )
+        if start_element != len(object_attributes):
+            return self.process_observable_relations(object_attributes, result_table, start_element + 1)
+        else:
+            return result_table
+
     def process_events(self, events):
         for event in events:
-            generic_actor = ThreatActor(
-                name='Unknown threats',
-                labels=['threat-actor'],
-                description='All unknown threats are represented by this pseudo threat actor. This entity helps to organize knowledge and indicators that could not be attributed to any other threats.'
-            )
             added_threats = []
             added_markings = []
             # Default values
@@ -78,17 +108,22 @@ class Misp:
             # Get all attributes
             indicators = []
             for attribute in event['Event']['Attribute']:
-                indicator = self.process_attribute(author, report_threats, attribute, generic_actor)
+                indicator = self.process_attribute(author, report_threats, attribute)
                 if indicator is not None:
                     indicators.append(indicator)
 
             # get all attributes of object
+            objects_relationships = []
             for object in event['Event']['Object']:
+                object_attributes = []
                 for attribute in object['Attribute']:
-                    indicator = self.process_attribute(author, report_threats, attribute, generic_actor)
+                    indicator = self.process_attribute(author, report_threats, attribute)
                     if indicator is not None:
                         indicators.append(indicator)
-
+                        if object['meta-category'] == 'file' and indicator[
+                            'indicator'].x_opencti_observable_type in file_types:
+                            object_attributes.append(indicator)
+                objects_relationships.extend(self.process_observable_relations(object_attributes, []))
             bundle_objects = [author]
             report_refs = []
             for report_marking in report_markings:
@@ -117,6 +152,9 @@ class Misp:
                     report_refs.append(relationship)
                     bundle_objects.append(relationship)
 
+            for object_relationship in objects_relationships:
+                bundle_objects.append(object_relationship)
+
             if len(report_refs) > 0:
                 report = Report(
                     name=event['Event']['info'],
@@ -128,18 +166,19 @@ class Misp:
                     object_refs=report_refs,
                     external_references=[reference_misp],
                     custom_properties={
-                        'x_opencti_report_class': 'Threat Report'
+                        'x_opencti_report_class': 'Threat Report',
+                        'x_opencti_object_status': 2
                     }
                 )
                 bundle_objects.append(report)
                 bundle = Bundle(objects=bundle_objects).serialize()
-                self.helper.send_stix2_bundle(bundle)
+                self.helper.send_stix2_bundle(bundle, None, self.update_existing_data, False)
 
             if self.misp_untag_event:
                 self.misp.untag(event['Event']['uuid'], self.misp_tag)
             self.misp.tag(event['Event']['uuid'], self.misp_imported_tag)
 
-    def process_attribute(self, author, report_threats, attribute, generic_actor):
+    def process_attribute(self, author, report_threats, attribute):
         resolved_attributes = self.resolve_type(attribute['type'], attribute['value'])
         if resolved_attributes is None:
             return None
@@ -151,9 +190,6 @@ class Misp:
                 attribute_markings = self.resolve_markings(attribute['Tag'])
             else:
                 attribute_markings = [TLP_WHITE]
-
-            if len(report_threats) == 0 and len(attribute_threats) == 0:
-                attribute_threats.append(generic_actor)
 
             indicator = Indicator(
                 name='Indicator',
@@ -205,7 +241,8 @@ class Misp:
                         }
                     )
                 )
-            return {'indicator': indicator, 'relationships': relationships, 'attribute_threats': attribute_threats, 'markings': attribute_markings}
+            return {'indicator': indicator, 'relationships': relationships, 'attribute_threats': attribute_threats,
+                    'markings': attribute_markings}
 
     def prepare_threats(self, galaxies):
         threats = []
